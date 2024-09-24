@@ -1,0 +1,95 @@
+---
+title: "AO Actual Wrangle"
+format: html
+editor: source
+---
+
+## Packages
+```{r}
+
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+# librarian downloads, if not already downloaded, and reads in needed packages
+librarian::shelf(tidyverse, here, janitor)
+
+```
+
+
+## Read in AO Actual Data
+```{r}
+
+raw_ao_acutal <- read_csv(here("data", "ao_actual_raw.csv"), col_types = cols()) %>% 
+  clean_names()%>% 
+  filter(!task_id %in% c("FREE", "PLAN(O)"),
+         #!task_state == "CLOSE_OUT",
+         dept == "RAMP") %>% 
+  select(emp, task_start, task_end, task_date_11, task_date_12, task_id)
+
+
+```
+## Fix Dates
+```{r}
+
+date_fix <- raw_ao_acutal %>% 
+  mutate(task_date_11 = str_replace_all(task_date_11, "\\.", "/")) %>% 
+  mutate(
+    task_date_11 = dmy(task_date_11),  # Convert day-month-year to Date
+    task_date_12 = mdy(task_date_12),  # Convert month-day-year to Date
+    task_date_11 = format(task_date_11, "%Y-%m-%d"),  # Reformat to year-month-day
+    task_date_12 = format(task_date_12, "%Y-%m-%d")   # Reformat to year-month-day
+  )   %>% 
+  rename(date = task_date_11)
+  
+
+```
+
+
+```{r}
+
+library(dplyr)
+library(lubridate)
+
+# Define a function to break task intervals into 5-minute slots
+break_into_intervals <- function(start_time, end_time, date) {
+  if (end_time > start_time) {
+    seq(from = as.POSIXct(start_time, origin = "1970-01-01"),
+        to = as.POSIXct(end_time, origin = "1970-01-01"),
+        by = "5 min") %>%
+      data.frame(interval = ., task_date = date)  # Rename date to task_date to avoid conflict
+  } else {
+    return(data.frame(interval = NA, task_date = date))  # Return empty if times are invalid
+  }
+}
+
+# Apply the function to each row, renaming the date in intervals
+intervals <- date_fix %>%
+  rowwise() %>%
+  mutate(
+    intervals = list(
+      break_into_intervals(task_start, task_end, date)
+    )
+  ) %>%
+  unnest(intervals, names_sep = "_") %>%  # Unnest and avoid name conflict with names_sep
+  ungroup() # Filter out invalid intervals
+
+# Count the number of employees working in each 5-minute interval
+employee_count_per_interval <- intervals %>%
+  mutate(five_min_bin = ceiling_date(intervals_interval, "5 minutes")) %>%  # Round down to nearest 5-minute interval
+  group_by(date, five_min_bin) %>%
+  summarise(actual_workload = length(unique(emp))) %>%  # Sum employees in each bin
+  ungroup() %>%
+  mutate(
+    time = hour(five_min_bin) + minute(five_min_bin) / 60,  # Convert to 0-24 hour format
+    station = "HNL",
+    weekday = as.factor(wday(date, label = TRUE))
+  ) %>%
+  select(date, time, actual_workload, station, weekday)
+
+
+write_csv(employee_count_per_interval, here("data", "clean_ao_actual.csv"))
+
+```
+

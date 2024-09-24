@@ -1,0 +1,1282 @@
+---
+title: "GAM Models"
+format: html
+editor: source
+---
+## Prep
+
+### Packages
+```{r}
+
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+# librarian downloads, if not already downloaded, and reads in needed packages
+librarian::shelf(tidyverse, here, mgcv, janitor, parallel)
+
+set.seed(42)
+
+```
+
+### Read in Data
+```{r}
+
+raw_data <- read_csv(here("data", "planned_vs_actual_consolidation.csv"), col_types = cols()) %>% 
+  clean_names() 
+
+
+```
+
+
+### clean data
+```{r}
+
+clean_data <- raw_data %>% 
+  filter(!actual_workload == 0) %>%
+  filter(!sched_workload == 0) %>%
+  select(date_time, station, actual_workload, sched_workload) %>% 
+  mutate(date_time = mdy_hm(date_time)) %>% 
+  group_by(date_time, station) %>% 
+  reframe(actual_workload = sum(actual_workload),
+         sched_workload = sum(sched_workload)) %>% 
+  mutate(weekday = wday(date_time, label = T),
+         time = hour(date_time) + minute(date_time) / 60,
+         date = as.Date(date_time),
+         ops_change = as.factor(if_else(date > "2024-01-24", "post", "pre")),
+         weekend_bin = as.factor(if_else(weekday %in% c("Sun", "Sat", "Fri"), "weekend", "week")),
+         station = as.factor(station),
+         weekday = as.factor(weekday),
+         log_act = log(actual_workload + 1),
+         log_sched = log(sched_workload + 1)) 
+
+```
+
+## Base Models
+
+### Model WD
+```{r}
+
+cl <- makeCluster(detectCores() - 1)
+
+# # Model for Actual Workload
+model_actual_wd <- bam(actual_workload ~ s(time, by = interaction(station), k = 50) + station,
+                        data = clean_data, family = poisson(link = "log"), cluster = cl)
+
+save(model_actual_wd, file = here("model_outputs", "model_actual_wd.RData"))
+
+
+# Model for Scheduled Workload
+model_scheduled_wd <- bam(sched_workload ~ s(time, by = interaction(station), k = 50) + station,
+                           data = clean_data, family = poisson(link = "log"), cluster = cl)
+
+save(model_scheduled_wd, file = here("model_outputs", "model_scheduled_wd.RData"))
+
+stopCluster(cl)
+```
+
+
+### Model Checks
+```{r}
+
+
+dispersion_stat <- summary(model_actual_wd$deviance) / summary(model_actual_wd$df.residual)
+dispersion_stat
+
+gam.check(model_actual_wd)
+
+acf(residuals(model_actual_wd))
+
+hist(clean_data$time)
+
+plot(fitted(model_actual_wd), residuals(model_actual_wd), xlab = "Fitted Values", ylab = "Residuals")
+abline(h = 0, col = "red")
+
+hist(log(clean_data$actual_workload + 1))
+
+```
+
+
+
+### Predict df WD
+```{r}
+
+# Create the new data set
+n_new <- 518  # Adjust the number of new data points if needed
+#new_dates <- seq(min(clean_data$date), max(clean_data$date), by = "day")
+new_time_intervals <- seq(0, 23.9167, by = 0.0833)  # 5-minute intervals
+#new_weekdays <- wday(new_dates, label = T)
+
+# Combine into a new dataframe
+new_df_wd <- data.frame(
+  #date = rep(new_dates, each = length(new_time_intervals)),
+  time = rep(new_time_intervals)
+)
+
+t_hnl <- clean_data %>% 
+  filter(station == "HNL")
+t_hnl_min <- min(t_hnl$time)
+t_hnl_max <- max(t_hnl$time)
+
+new_df_wd_hnl <- new_df_wd %>% 
+  mutate(station = "HNL")%>% 
+  filter(time  >= t_hnl_min,
+         time <= t_hnl_max)
+
+
+
+t_ito <- clean_data %>% 
+  filter(station == "ITO")
+
+t_ito_min <- min(t_ito$time)
+t_ito_max <- max(t_ito$time)
+
+new_df_wd_ito <- new_df_wd %>% 
+  mutate(station = "ITO")%>% 
+  filter(time  >= t_ito_min,
+         time <= 20.99)
+
+
+
+t_koa <- clean_data %>% 
+  filter(station == "KOA")
+
+t_koa_min <- min(t_koa$time)
+t_koa_max <- max(t_koa$time)
+
+new_df_wd_koa <- new_df_wd %>% 
+  mutate(station = "KOA")%>% 
+  filter(time  >= t_koa_min,
+         time <= t_koa_max)
+
+
+
+t_lih <- clean_data %>% 
+  filter(station == "LIH")
+
+t_lih_min <- min(t_lih$time)
+t_lih_max <- max(t_lih$time)
+
+new_df_wd_lih <- new_df_wd %>% 
+  mutate(station = "LIH")%>% 
+  filter(time  >= t_lih_min,
+         time <= 21.89)
+
+t_ogg <- clean_data %>% 
+  filter(station == "OGG")
+
+t_ogg_min <- min(t_ogg$time)
+t_ogg_max <- max(t_ogg$time)
+
+new_df_wd_ogg <- new_df_wd %>% 
+  mutate(station = "OGG")%>% 
+  filter(time  >= t_ogg_min,
+         time <= t_lih_max)
+
+
+new_df_wd <- rbind(new_df_wd_hnl, new_df_wd_ito, new_df_wd_koa, new_df_wd_lih, new_df_wd_ogg)
+
+```
+
+### Predict
+
+```{r}
+
+# Predict with confidence intervals for actual workload model
+pred_actual_wd <- predict(model_actual_wd, newdata = new_df_wd, se.fit = TRUE)
+new_df_wd$actual_pred_wd <- exp(pred_actual_wd$fit)
+new_df_wd$actual_pred_wd_upper <- exp(pred_actual_wd$fit + 1.96 * pred_actual_wd$se.fit)
+new_df_wd$actual_pred_wd_lower <- exp(pred_actual_wd$fit - 1.96 * pred_actual_wd$se.fit)
+
+# Predict with confidence intervals for scheduled workload model
+pred_scheduled_wd <- predict(model_scheduled_wd, newdata = new_df_wd, se.fit = TRUE)
+new_df_wd$scheduled_pred_wd <- exp(pred_scheduled_wd$fit)
+new_df_wd$scheduled_pred_wd_upper <- exp(pred_scheduled_wd$fit + 1.96 * pred_scheduled_wd$se.fit)
+new_df_wd$scheduled_pred_wd_lower <- exp(pred_scheduled_wd$fit - 1.96 * pred_scheduled_wd$se.fit)
+
+
+
+```
+
+
+
+
+### Visuzalize 
+```{r}
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_station/predicted_vs_scheduled_model_results"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+# Modify the data frame for plotting
+wd_df <- new_df_wd %>%
+  select(time, station, actual_pred_wd, actual_pred_wd_upper, actual_pred_wd_lower,
+         scheduled_pred_wd, scheduled_pred_wd_upper, scheduled_pred_wd_lower) %>% 
+  pivot_longer(cols = c(actual_pred_wd, scheduled_pred_wd), 
+               names_to = "workload_type", 
+               values_to = "predicted_workload") 
+
+# Loop to create plots by station with CIs
+for (i in seq_along((weekday_station_combinations$station))) {
+  
+  station_cat <- weekday_station_combinations$station[i]
+  
+  filtered_data <- wd_df %>%
+    filter(station == station_cat)
+  
+  # Create the plot for each combination with CI ribbons
+  plot <- ggplot(filtered_data, aes(x = time, y = predicted_workload, color = workload_type)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = if_else(workload_type == "actual_pred_wd", actual_pred_wd_lower, scheduled_pred_wd_lower), 
+                    ymax = if_else(workload_type == "actual_pred_wd", actual_pred_wd_upper, scheduled_pred_wd_upper), 
+                    fill = workload_type), alpha = 0.2) +
+    labs(title = paste("Predicted Workloads with Confidence Intervals at", station_cat),
+         x = "Time (Hours)",
+         y = "Predicted Workload",
+         color = "Workload Type",
+         fill = "Workload Type") +
+    theme_minimal() +
+    scale_color_manual(values = c("actual_pred_wd" = "#413691", "scheduled_pred_wd" = "#D2058A")) +
+    scale_fill_manual(values = c("actual_pred_wd" = "#413691", "scheduled_pred_wd" = "#D2058A"))
+  
+  v_wd_station[[paste0(station_cat)]] <- plot
+  
+  file_name <- paste0("predicted_workloads_", station_cat, ".jpeg")
+  
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+v_wd_station
+
+```
+
+
+### Visualize difference 
+```{r}
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_station/difference"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Calculate the difference and confidence intervals for each station and time combo
+diff <- new_df_wd %>%
+  group_by(station, time) %>%
+  mutate(
+    difference = round(actual_pred_wd - scheduled_pred_wd, 0),
+    diff_se = sqrt((actual_pred_wd_upper - actual_pred_wd) ^ 2 + (scheduled_pred_wd_upper - scheduled_pred_wd) ^ 2) / 1.96,
+    difference_upper = round(difference + 1.96 * diff_se, 0),
+    difference_lower = round(difference - 1.96 * diff_se, 0)
+  ) %>%
+  ungroup()
+
+### Visualize the difference with CIs
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_station/difference"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Get unique combinations of `station`
+weekday_station_combinations <- unique(diff %>% select(station))
+
+# Initialize an empty list to store the plots
+d_wd_station <- list()
+
+# Loop through each combination of `station`
+for (i in seq_len(nrow(weekday_station_combinations))) {
+  
+  # Extract the specific combination of station
+  station_cat <- weekday_station_combinations$station[i]
+  
+  # Filter data for the specific combination
+  combo_data <- diff %>%
+    filter(station == station_cat)
+  
+  # Create the plot with a horizontal line at y = 0 and CI ribbons
+  plot <- ggplot(combo_data, aes(x = time, y = difference)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = difference_lower, ymax = difference_upper), alpha = 0.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    labs(title = paste("Difference between Actual and Scheduled Workloads at", station_cat),
+         x = "Time (Hours)",
+         y = "Difference (Actual - Scheduled)") +
+    theme_minimal()
+  
+  # Store the plot in the list
+  d_wd_station[[paste0(station_cat)]] <- plot
+  
+  # Define the file name based on the station
+  file_name <- paste0("workload_differences_", station_cat, ".jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+# View the list of plots
+d_wd_station
+
+
+
+```
+
+
+
+## Weekday Models
+### Model Weekday
+```{r}
+
+hnl_clean_data <- clean_data %>% 
+  filter(station == "HNL")
+
+cl <- makeCluster(detectCores() - 1)
+
+# # Model for Actual Workload
+model_actual_day <- bam(actual_workload ~ s(time, by = interaction(weekday), k = 50) + weekday,
+                        data = hnl_clean_data, family = poisson(link = "log"), cluster = cl)
+
+save(model_actual_day, file = here("model_outputs", "model_actual_day.RData"))
+
+
+# Model for Scheduled Workload
+model_scheduled_day <- bam(sched_workload ~ s(time, by = interaction(weekday), k = 50) + weekday,
+                           data = hnl_clean_data, family = poisson(link = "log"), cluster = cl)
+
+save(model_scheduled_day, file = here("model_outputs", "model_scheduled_day.RData"))
+
+stopCluster(cl)
+
+```
+
+### Predict df WD
+```{r}
+
+# Create the new data set
+n_new <- 518  # Adjust the number of new data points if needed
+new_dates <- seq(min(clean_data$date), max(clean_data$date), by = "day")
+new_time_intervals <- seq(0, 23.9167, by = 0.0833)  # 5-minute intervals
+new_weekdays <- wday(new_dates, label = T)
+
+# Combine into a new dataframe
+new_df_wd <- data.frame(
+  date = rep(new_dates, each = length(new_time_intervals)),
+  time = rep(new_time_intervals),
+  weekday = rep(new_weekdays)
+)
+
+t_hnl <- clean_data %>% 
+  filter(station == "HNL")
+t_hnl_min <- min(t_hnl$time)
+t_hnl_max <- max(t_hnl$time)
+
+new_df_wd_hnl <- new_df_wd %>% 
+  mutate(station = "HNL")%>% 
+  filter(time  >= t_hnl_min,
+         time <= t_hnl_max)
+
+
+
+t_ito <- clean_data %>% 
+  filter(station == "ITO")
+
+t_ito_min <- min(t_ito$time)
+t_ito_max <- max(t_ito$time)
+
+new_df_wd_ito <- new_df_wd %>% 
+  mutate(station = "ITO")%>% 
+  filter(time  >= t_ito_min,
+         time <= 20.99)
+
+
+
+t_koa <- clean_data %>% 
+  filter(station == "KOA")
+
+t_koa_min <- min(t_koa$time)
+t_koa_max <- max(t_koa$time)
+
+new_df_wd_koa <- new_df_wd %>% 
+  mutate(station = "KOA")%>% 
+  filter(time  >= t_koa_min,
+         time <= t_koa_max)
+
+
+
+t_lih <- clean_data %>% 
+  filter(station == "LIH")
+
+t_lih_min <- min(t_lih$time)
+t_lih_max <- max(t_lih$time)
+
+new_df_wd_lih <- new_df_wd %>% 
+  mutate(station = "LIH")%>% 
+  filter(time  >= t_lih_min,
+         time <= 21.89)
+
+t_ogg <- clean_data %>% 
+  filter(station == "OGG")
+
+t_ogg_min <- min(t_ogg$time)
+t_ogg_max <- max(t_ogg$time)
+
+new_df_wd_ogg <- new_df_wd %>% 
+  mutate(station = "OGG")%>% 
+  filter(time  >= t_ogg_min,
+         time <= t_lih_max)
+
+
+new_df_day <- rbind(new_df_wd_hnl, new_df_wd_ito, new_df_wd_koa, new_df_wd_lih, new_df_wd_ogg) %>% 
+  ungroup() %>% 
+  filter(station == "HNL") %>% 
+  group_by(weekday, time) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!c(temp_id, station, date)) %>% 
+  ungroup() %>% 
+  filter(time >= 3,
+         time <= 23)
+
+```
+
+### Predict
+
+```{r}
+
+### Predict with CIs
+
+# Weekday
+pred_actual_day <- predict(model_actual_day, newdata = new_df_day, se.fit = TRUE)
+new_df_day$actual_pred_day <- exp(pred_actual_day$fit)
+new_df_day$actual_pred_day_upper <- exp(pred_actual_day$fit + 1.96 * pred_actual_day$se.fit)
+new_df_day$actual_pred_day_lower <- exp(pred_actual_day$fit - 1.96 * pred_actual_day$se.fit)
+
+pred_scheduled_day <- predict(model_scheduled_day, newdata = new_df_day, se.fit = TRUE)
+new_df_day$scheduled_pred_day <- exp(pred_scheduled_day$fit)
+new_df_day$scheduled_pred_day_upper <- exp(pred_scheduled_day$fit + 1.96 * pred_scheduled_day$se.fit)
+new_df_day$scheduled_pred_day_lower <- exp(pred_scheduled_day$fit - 1.96 * pred_scheduled_day$se.fit)
+
+
+```
+
+### Visuzalize 
+```{r}
+### Visualize with CIs
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_weekday/predicted_vs_scheduled_model_results"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# No need to pivot the CIs into long format; keep them separate
+day_df <- new_df_day %>%
+  select(time, weekday, actual_pred_day, actual_pred_day_upper, actual_pred_day_lower, 
+         scheduled_pred_day, scheduled_pred_day_upper, scheduled_pred_day_lower)
+
+# Get unique combinations of weekdays
+day_combinations <- unique(new_df_day %>% select(weekday))
+
+v_day <- list()
+
+# Loop through each combination of weekday, create a plot, and save it
+for (i in seq_along(day_combinations$weekday)) {
+  
+  day_cat <- day_combinations$weekday[i]
+  
+  # Filter data for the specific weekday
+  filtered_data <- day_df %>%
+    filter(weekday == day_cat)
+  
+  # Create the plot with CI ribbons
+  plot <- ggplot(filtered_data, aes(x = time)) +
+    geom_line(aes(y = actual_pred_day, color = "actual_pred_day")) +
+    geom_ribbon(aes(ymin = actual_pred_day_lower, ymax = actual_pred_day_upper, fill = "actual_pred_day"), alpha = 0.2) +
+    geom_line(aes(y = scheduled_pred_day, color = "scheduled_pred_day")) +
+    geom_ribbon(aes(ymin = scheduled_pred_day_lower, ymax = scheduled_pred_day_upper, fill = "scheduled_pred_day"), alpha = 0.2) +
+    labs(title = paste("Predicted Workloads Over Time on", day_cat, "at HNL"),
+         x = "Time (Hours)",
+         y = "Predicted Workload",
+         color = "Workload Type",
+         fill = "Workload Type") +
+    theme_minimal() +
+    scale_color_manual(values = c("actual_pred_day" = "#413691", "scheduled_pred_day" = "#D2058A")) +
+    scale_fill_manual(values = c("actual_pred_day" = "#413691", "scheduled_pred_day" = "#D2058A"))
+  
+  # Store the plot in the list
+  v_day[[paste0(day_cat)]] <- plot
+  
+  # Define the file name based on the weekday
+  file_name <- paste0("predicted_workloads_", day_cat, "_at_HNL.jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+v_day
+
+
+```
+
+### Visualize difference 
+```{r}
+
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_weekdaydifference"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Calculate the difference and confidence intervals for each weekday and time combo
+diff <- new_df_day %>%
+  group_by(weekday, time) %>%
+  mutate(
+    difference = round(actual_pred_day - scheduled_pred_day, 0),
+    diff_se = sqrt((actual_pred_day_upper - actual_pred_day) ^ 2 + (scheduled_pred_day_upper - scheduled_pred_day) ^ 2) / 1.96,
+    difference_upper = round(difference + 1.96 * diff_se, 0),
+    difference_lower = round(difference - 1.96 * diff_se, 0)
+  ) %>%
+  ungroup()
+
+### Visualize the difference with CIs
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_weekday/difference"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Get unique combinations of `weekday`
+weekday_combinations <- unique(diff %>% select(weekday)) 
+
+# Initialize an empty list to store the plots
+d_day <- list()
+
+# Loop through each combination of `weekday`
+for (i in seq_len(nrow(weekday_combinations))) {
+  
+  # Extract the specific combination of weekday
+  day_cat <- weekday_combinations$weekday[i]
+  
+  # Filter data for the specific combination
+  combo_data <- diff %>%
+    filter(weekday == day_cat)
+  
+  # Create the plot with a horizontal line at y = 0 and CI ribbons
+  plot <- ggplot(combo_data, aes(x = time, y = difference)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = difference_lower, ymax = difference_upper), alpha = 0.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    labs(title = paste("Difference between Actual and Scheduled Workloads on", day_cat),
+         x = "Time (Hours)",
+         y = "Difference (Actual - Scheduled)") +
+    theme_minimal()
+  
+  # Store the plot in the list
+  d_day[[paste0(day_cat)]] <- plot
+  
+  # Define the file name based on the weekday
+  file_name <- paste0("workload_differences_", day_cat, "_at_HNL.jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+# View the list of plots
+d_day
+
+
+```
+
+## Weekend Bin/Base Models
+### Model
+```{r}
+cl <- makeCluster(detectCores() - 1)
+# weekend
+model_actual_weekend <- bam(actual_workload ~ s(time, by = interaction(weekend_bin, station), k = 50) + station + weekend_bin,
+                            data = clean_data, family = poisson(link="log"), cluster = cl)
+
+model_scheduled_weekend <- bam(sched_workload ~ s(time, by = interaction(weekend_bin, station), k = 50) + station + weekend_bin, 
+                               data = clean_data, family = poisson(link="log"), cluster = cl)
+
+stopCluster(cl)
+```
+
+### Make df
+```{r}
+# Create the new data set
+n_new <- 518  # Adjust the number of new data points if needed
+new_dates <- seq(min(clean_data$date), max(clean_data$date), by = "day")
+new_time_intervals <- seq(0, 23.9167, by = 0.0833)  # 5-minute intervals
+new_weekdays <- wday(new_dates, label = T)
+
+# Combine into a new dataframe
+new_df_weekend <- data.frame(
+  date = rep(new_dates, each = length(new_time_intervals)),
+  time = rep(new_time_intervals, times = n_new),
+  weekday = rep(new_weekdays, each = length(new_time_intervals))
+)
+
+new_df_weekend <- new_df_weekend %>% 
+  mutate(
+         weekend_bin = if_else(weekday %in% c("Sun", "Sat", "Fri"), "weekend", "week")) %>% 
+  group_by(date, time, weekend_bin) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id)
+
+
+new_df_weekend_hnl <- new_df_weekend %>% 
+  mutate(station = "HNL")%>% 
+  filter(time  >= t_hnl_min,
+         time <= t_hnl_max)
+
+new_df_weekend_ito <- new_df_weekend %>% 
+  mutate(station = "ITO")%>% 
+  filter(time  >= t_ito_min,
+         time <= 20.99)
+
+new_df_weekend_koa <- new_df_weekend %>% 
+  mutate(station = "KOA")%>% 
+  filter(time  >= t_koa_min,
+         time <= 21.00)
+
+new_df_weekend_lih <- new_df_weekend %>% 
+  mutate(station = "LIH")%>% 
+  filter(time  >= t_lih_min,
+         time <= 21.89)
+
+
+new_df_weekend_ogg <- new_df_weekend %>% 
+  mutate(station = "OGG")%>% 
+  filter(time  >= t_ogg_min,
+         time <= t_lih_max)
+
+
+new_weekend_weekend <- rbind(new_df_weekend_hnl, new_df_weekend_ito, 
+                             new_df_weekend_koa, new_df_weekend_lih, 
+                             new_df_weekend_ogg) %>% 
+  group_by(station, time, weekend_bin) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>% 
+  ungroup(time)
+
+
+
+
+```
+
+### Predict
+```{r}
+# weekend
+pred_actual_weekend <- predict(model_actual_weekend, newdata = new_weekend_weekend, se.fit = TRUE)
+new_weekend_weekend$actual_pred_weekend <- exp(pred_actual_weekend$fit)
+new_weekend_weekend$actual_pred_weekend_upper <- exp(pred_actual_weekend$fit + 1.96 * pred_actual_weekend$se.fit)
+new_weekend_weekend$actual_pred_weekend_lower <- exp(pred_actual_weekend$fit - 1.96 * pred_actual_weekend$se.fit)
+
+pred_scheduled_weekend <- predict(model_scheduled_weekend, newdata = new_weekend_weekend, se.fit = TRUE)
+new_weekend_weekend$scheduled_pred_weekend <- exp(pred_scheduled_weekend$fit)
+new_weekend_weekend$scheduled_pred_weekend_upper <- exp(pred_scheduled_weekend$fit + 1.96 * pred_scheduled_weekend$se.fit)
+new_weekend_weekend$scheduled_pred_weekend_lower <- exp(pred_scheduled_weekend$fit - 1.96 * pred_scheduled_weekend$se.fit)
+
+
+
+```
+
+
+### Visuzalize 
+```{r}
+
+
+
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_station_weekend/predicted_vs_scheduled_model_results"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Select relevant columns including CI bounds for both workloads
+weekend_df <- new_weekend_weekend %>%
+  select(time, actual_pred_weekend, actual_pred_weekend_upper, actual_pred_weekend_lower, 
+         scheduled_pred_weekend, scheduled_pred_weekend_upper, scheduled_pred_weekend_lower, 
+         weekend_bin, station) 
+
+# Get unique combinations of weekend_bin and station from the data
+weekend_station_combinations <- unique(new_weekend_weekend %>% select(station, weekend_bin))
+
+# Initialize an empty list to store the plots
+v_weekend_station <- list()
+
+# Loop through each combination of weekend_bin and station, create a plot, and save it
+for (i in seq_along((weekend_station_combinations$weekend_bin))) {
+  
+  # Extract the specific combination of weekend_bin and station
+  weekend_bin_cat <- weekend_station_combinations$weekend_bin[i]
+  station_cat <- weekend_station_combinations$station[i]
+  
+  # Filter data for the specific combination
+  filtered_data <- weekend_df %>%
+    filter(weekend_bin == weekend_bin_cat, 
+           station == station_cat)
+  
+  # Create the plot for each combination, adding CIs with geom_ribbon
+  plot <- ggplot(filtered_data, aes(x = time)) +
+    
+    # Add ribbon for actual_pred_weekend confidence intervals
+    geom_ribbon(aes(ymin = actual_pred_weekend_lower, ymax = actual_pred_weekend_upper), 
+                fill = "#413691", alpha = 0.2) +
+    
+    # Add ribbon for scheduled_pred_weekend confidence intervals
+    geom_ribbon(aes(ymin = scheduled_pred_weekend_lower, ymax = scheduled_pred_weekend_upper), 
+                fill = "#D2058A", alpha = 0.2) +
+    
+    # Plot the predicted workloads as lines
+    geom_line(aes(y = actual_pred_weekend, color = "actual_pred_weekend")) +
+    geom_line(aes(y = scheduled_pred_weekend, color = "scheduled_pred_weekend")) +
+    
+    # Add titles and labels
+    labs(title = paste("Predicted Workloads Over Time at", station_cat, "on", weekend_bin_cat),
+         x = "Time (Hours)",
+         y = "Predicted Workload",
+         color = "Workload Type",
+         fill = "Workload Type") +
+    
+    # Set the theme and color scale
+    theme_minimal() +
+    scale_color_manual(values = c("actual_pred_weekend" = "#413691", "scheduled_pred_weekend" = "#D2058A"))
+  
+  # Store the plot in the list
+  v_weekend_station[[paste0(station_cat, "_on_", weekend_bin_cat)]] <- plot
+  
+  # Define the file name based on the station and weekend_bin
+  file_name <- paste0("predicted_workloads_", station_cat, "_on_", weekend_bin_cat, ".jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+v_weekend_station
+
+```
+
+
+### Visualize difference 
+```{r}
+
+
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_station_weekend/difference"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Calculate the difference and CI for differences
+diff <- new_weekend_weekend %>%
+  group_by(weekend_bin, time) %>%
+  mutate(
+    # Calculate the difference
+    difference = actual_pred_weekend - scheduled_pred_weekend,
+    # Round the difference
+    difference = round(difference, 0),
+    # CI bounds for differences
+    ci_low_diff = round((actual_pred_weekend_lower - scheduled_pred_weekend_upper), 0),
+    ci_high_diff = round((actual_pred_weekend_upper - scheduled_pred_weekend_lower), 0)
+  )
+
+# Initialize an empty list to store the plots
+d_weekend <- list()
+
+# Get unique combinations of weekend_bin and station
+weekend_station_combinations <- unique(new_weekend_weekend %>% select(station, weekend_bin))
+
+# Loop through each combination of weekend_bin and station to create plots
+for (i in seq_along(weekend_station_combinations$weekend_bin)) {
+  
+  # Extract the specific combination of weekend_bin and station
+  weekend_bin_cat <- weekend_station_combinations$weekend_bin[i]
+  station_cat <- weekend_station_combinations$station[i]
+  
+  # Filter data for the specific combination
+  day_data <- diff %>% filter(weekend_bin == weekend_bin_cat, station == station_cat)
+  
+  # Create the plot with CI lines and a horizontal line at y = 0
+  plot <- ggplot(day_data, aes(x = time)) +
+    # Add CI lines for the differences
+    geom_ribbon(aes(ymin = ci_low_diff, ymax = ci_high_diff), fill = "#B0B0B0", alpha = 0.5) +
+    # Add the difference line
+    geom_line(aes(y = difference)) +
+    # Add a horizontal line at y = 0
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    # Add titles and labels
+    labs(title = paste("Differences between Actual and Scheduled Predictions on", weekend_bin_cat, "at", station_cat),
+         x = "Time (Hours)",
+         y = "Difference (Actual - Scheduled)") +
+    theme_minimal()
+  
+  # Store the plot in the list
+  d_weekend[[paste0(weekend_bin_cat, "_at_", station_cat)]] <- plot
+  
+  # Define the file name based on the combination
+  file_name <- paste0("workload_differences_", weekend_bin_cat, "_at_", station_cat, ".jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+# View the list of plots
+d_weekend
+```
+
+## Ops Change Models
+
+### Model
+```{r}
+cl <- makeCluster(detectCores() - 1)
+
+model_actual_ops <- bam(actual_workload ~ s(time, by = ops_change, k = 50) + ops_change, poisson(link = "log"), 
+                        data = clean_data, cluster = cl)
+model_scheduled_ops <- bam(sched_workload ~ s(time, by = ops_change, k = 50) + ops_change, poisson(link = "log"), 
+                           data = clean_data, cluster = cl)
+
+stopCluster(cl)
+
+```
+
+
+### Predict df ops
+```{r}
+
+# Create the new data set
+n_new <- 518  # Adjust the number of new data points if needed
+new_dates <- seq(min(clean_data$date), max(clean_data$date), by = "day")
+new_time_intervals <- seq(0, 23.9167, by = 0.0833)  # 5-minute intervals
+
+# Combine into a new dataframe
+new_df_ops <- data.frame(
+  date = rep(new_dates, each = length(new_time_intervals)),
+  time = rep(new_time_intervals, times = n_new)
+)
+
+new_df_ops <- new_df_ops %>% 
+  mutate(ops_change = if_else(date > "2024-01-24", "post", "pre"))  %>% 
+  group_by(time, ops_change) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id)
+
+
+
+
+```
+
+### Predict
+```{r}
+
+
+### Predict
+# Predict with standard errors for actual operations
+pred_actual_ops <- predict(model_actual_ops, newdata = new_df_ops, se.fit = TRUE)
+new_df_ops$actual_pred_ops <- exp(pred_actual_ops$fit)
+new_df_ops$actual_pred_ops_se <- pred_actual_ops$se.fit
+new_df_ops$actual_pred_ops_lower <- exp(pred_actual_ops$fit - 1.96 * pred_actual_ops$se.fit)
+new_df_ops$actual_pred_ops_upper <- exp(pred_actual_ops$fit + 1.96 * pred_actual_ops$se.fit)
+
+# Predict with standard errors for scheduled operations
+pred_scheduled_ops <- predict(model_scheduled_ops, newdata = new_df_ops, se.fit = TRUE)
+new_df_ops$scheduled_pred_ops <- exp(pred_scheduled_ops$fit)
+new_df_ops$scheduled_pred_ops_se <- pred_scheduled_ops$se.fit
+new_df_ops$scheduled_pred_ops_lower <- exp(pred_scheduled_ops$fit - 1.96 * pred_scheduled_ops$se.fit)
+new_df_ops$scheduled_pred_ops_upper <- exp(pred_scheduled_ops$fit + 1.96 * pred_scheduled_ops$se.fit)
+
+
+```
+
+### Visualize with CIs
+```{r}
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_ops_change/predicted_vs_scheduled_model_results"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# No need to pivot the CIs into long format; keep them separate
+ops_df <- new_df_ops %>%
+  select(time, ops_change, actual_pred_ops, actual_pred_ops_upper, actual_pred_ops_lower,
+         scheduled_pred_ops, scheduled_pred_ops_upper, scheduled_pred_ops_lower)
+
+# Get unique combinations of ops_change
+ops_combinations <- unique(ops_df$ops_change)
+
+v_ops <- list()
+
+# Loop through each combination of ops_change and create a plot
+for (i in seq_along(ops_combinations)) {
+  
+  ops_cat <- ops_combinations[i]
+  
+  # Filter data for the specific ops_change
+  filtered_data <- ops_df %>%
+    filter(ops_change == ops_cat)
+  
+  # Create the plot with CI ribbons
+  plot <- ggplot(filtered_data, aes(x = time)) +
+    geom_line(aes(y = actual_pred_ops, color = "actual_pred_ops")) +
+    geom_ribbon(aes(ymin = actual_pred_ops_lower, ymax = actual_pred_ops_upper, fill = "actual_pred_ops"), alpha = 0.2) +
+    geom_line(aes(y = scheduled_pred_ops, color = "scheduled_pred_ops")) +
+    geom_ribbon(aes(ymin = scheduled_pred_ops_lower, ymax = scheduled_pred_ops_upper, fill = "scheduled_pred_ops"), alpha = 0.2) +
+    labs(title = paste("Predicted Workloads Over Time with CIs on", ops_cat),
+         x = "Time (Hours)",
+         y = "Predicted Workload",
+         color = "Workload Type",
+         fill = "Workload Type") +
+    theme_minimal() +
+    scale_color_manual(values = c("actual_pred_ops" = "#413691", "scheduled_pred_ops" = "#D2058A")) +
+    scale_fill_manual(values = c("actual_pred_ops" = "#413691", "scheduled_pred_ops" = "#D2058A"))
+  
+  # Store the plot in the list
+  v_ops[[paste0(ops_cat)]] <- plot
+  
+  # Define the file name based on the ops_change
+  file_name <- paste0("predicted_workloads_", ops_cat, ".jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+# View the list of plots
+v_ops
+```
+
+### Visualize difference with CIs
+```{r}
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_ops_change/difference"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Calculate the standard error of the difference
+diff <- new_df_ops %>%
+  group_by(ops_change, time) %>%
+  mutate(
+    difference = round(actual_pred_ops - scheduled_pred_ops, 0),
+    se_diff = sqrt(actual_pred_ops_se^2 + scheduled_pred_ops_se^2),
+    difference_lower = round(difference - 1.96 * se_diff, 0),
+    difference_upper = round(difference + 1.96 * se_diff, 0)
+  ) %>%
+  ungroup() %>%
+  select(ops_change, time, difference, difference_lower, difference_upper)
+
+# Initialize an empty list to store the plots
+d_ops <- list()
+
+# Get unique ops_changes from the data
+op_change <- unique(diff$ops_change)
+
+# Loop through each ops_change and create a plot, storing them in the list
+for(i in seq_along(op_change)) {
+  op_change_cat <- op_change[i]
+  
+  # Filter data for the specific ops_change
+  day_data <- diff %>% filter(ops_change == op_change_cat)
+  
+  # Create the plot with CI ribbons
+  plot <- ggplot(day_data, aes(x = time, y = difference)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = difference_lower, ymax = difference_upper), alpha = 0.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    labs(title = paste("Distribution of Differences between Actual and Scheduled Predictions on", op_change_cat),
+         x = "Time (Hours)",
+         y = "Difference (Actual - Scheduled)") +
+    theme_minimal() +
+    ylim(min(diff$difference_lower), max(diff$difference_upper))
+  
+  # Store the plot in the list
+  d_ops[[paste0(op_change_cat)]] <- plot
+  
+  # Define the file name based on the ops_change
+  file_name <- paste0("workload_differences_", op_change_cat, ".jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+# View the list of plots
+d_ops
+```
+
+## AO Acutal Models
+### Read in clean AO Acutal
+```{r}
+
+clean_ao_acutal <- read_csv(here("data", "clean_ao_actual.csv"), col_types = cols())%>% 
+  mutate(weekend_bin = as.factor(if_else(weekday %in% c("Sun", "Sat", "Fri"), "weekend", "week")))
+
+clean_hnl_dt <- clean_data %>% 
+  filter(station == "HNL",
+         date > min(clean_ao_acutal$date),
+         date < max(clean_ao_acutal$date)) 
+
+```
+
+### Model
+```{r}
+cl <- makeCluster(detectCores() - 1)
+
+model_actual_hnl <- bam(actual_workload ~ s(time, by = weekend_bin, k = 50) + weekend_bin, poisson(link = "log"), 
+                        data = clean_hnl_dt, cluster = cl)
+
+model_scheduled_hnl <- bam(sched_workload ~ s(time, by = weekend_bin, k = 50)+ weekend_bin, poisson(link = "log"), 
+                           data = clean_hnl_dt, cluster = cl)
+
+model_ao_actual_hnl <- bam(actual_workload ~ s(time, by = weekend_bin, k = 50)+ weekend_bin, poisson(link = "log"), 
+                           data = clean_ao_acutal, cluster = cl)
+
+stopCluster(cl)
+```
+
+### New Pred DF
+```{r}
+
+new_time_intervals <- seq(0, 23.9167, by = 0.0833)  # 5-minute intervals
+#new_weekdays <- wday(new_dates, label = T)
+
+# Combine into a new dataframe
+new_df_ao <- data.frame(
+  time = rep(new_time_intervals)
+)
+
+wk <- new_df_ao %>% 
+  mutate(weekend_bin ="weekend")
+
+wknd <- new_df_ao %>% 
+  mutate(weekend_bin = "week")
+
+
+new_df_ao <- rbind(wk, wknd)
+
+```
+
+### Predict
+```{r}
+
+
+### Predict
+# Predict with standard errors for actual operations
+pred_actual_hnl <- predict(model_actual_hnl, newdata = new_df_ao, se.fit = TRUE)
+new_df_ao$actual_pred_hnl <- exp(pred_actual_hnl$fit)
+new_df_ao$actual_pred_hnl_se <- pred_actual_hnl$se.fit
+new_df_ao$actual_pred_hnl_lower <- exp(pred_actual_hnl$fit - 1.96 * pred_actual_hnl$se.fit)
+new_df_ao$actual_pred_hnl_upper <- exp(pred_actual_hnl$fit + 1.96 * pred_actual_hnl$se.fit)
+
+# Predict with standard errors for scheduled operations
+pred_scheduled_hnl <- predict(model_scheduled_hnl, newdata = new_df_ao, se.fit = TRUE)
+new_df_ao$scheduled_pred_hnl <- exp(pred_scheduled_hnl$fit)
+new_df_ao$scheduled_pred_hnl_se <- pred_scheduled_hnl$se.fit
+new_df_ao$scheduled_pred_hnl_lower <- exp(pred_scheduled_hnl$fit - 1.96 * pred_scheduled_hnl$se.fit)
+new_df_ao$scheduled_pred_hnl_upper <- exp(pred_scheduled_hnl$fit + 1.96 * pred_scheduled_hnl$se.fit)
+
+
+# Predict with standard errors for scheduled operations
+pred_actual_hnl_ao <- predict(model_ao_actual_hnl, newdata = new_df_ao, se.fit = TRUE)
+new_df_ao$actual_pred_hnl_ao <- exp(pred_actual_hnl_ao$fit)
+new_df_ao$actual_pred_hnl_ao_se <- pred_actual_hnl_ao$se.fit
+new_df_ao$actual_pred_hnl_ao_lower <- exp(pred_actual_hnl_ao$fit - 1.96 * pred_actual_hnl_ao$se.fit)
+new_df_ao$actual_pred_hnl_ao_upper <- exp(pred_actual_hnl_ao$fit + 1.96 * pred_actual_hnl_ao$se.fit)
+
+
+
+```
+
+### Plot
+```{r}
+
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_weekend_ao/predicted_vs_scheduled_model_results"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+weekend_ao_df <- new_df_ao %>%
+  select(time, actual_pred_hnl, actual_pred_hnl_lower, actual_pred_hnl_upper, 
+         scheduled_pred_hnl, scheduled_pred_hnl_lower, scheduled_pred_hnl_upper, actual_pred_hnl_ao, actual_pred_hnl_ao_lower, actual_pred_hnl_ao_upper,
+         weekend_bin) 
+
+
+# Get unique combinations of weekend_bin and station from the data
+weekend_combinations <- unique(weekend_ao_df %>% select(weekend_bin))
+
+# Initialize an empty list to store the plots
+v_weekend_ao <- list()
+
+
+# Loop through each combination of weekend_bin and station, create a plot, and save it
+for (i in seq_along((weekend_combinations$weekend_bin))) {
+  
+  # Extract the specific combination of weekend_bin and station
+  weekend_bin_cat <- weekend_combinations$weekend_bin[i]
+
+  # Filter data for the specific combination
+  filtered_data <- weekend_ao_df %>%
+    filter(weekend_bin == weekend_bin_cat)
+  
+plot <- ggplot(filtered_data, aes(x = time)) +
+    geom_line(aes(y = actual_pred_hnl, color = "actual_pred_hnl")) +
+    geom_ribbon(aes(ymin = actual_pred_hnl_lower, ymax = actual_pred_hnl_upper, fill = "actual_pred_hnl"), alpha = 0.2) +
+    geom_line(aes(y = scheduled_pred_hnl, color = "scheduled_pred_hnl")) +
+    geom_ribbon(aes(ymin = scheduled_pred_hnl_lower, ymax = scheduled_pred_hnl_upper, fill = "scheduled_pred_hnl"), alpha = 0.2) +
+    geom_line(aes(y = actual_pred_hnl_ao, color = "actual_pred_hnl_ao")) +
+    geom_ribbon(aes(ymin = actual_pred_hnl_ao_lower, ymax = actual_pred_hnl_ao_upper, fill = "actual_pred_hnl_ao"), alpha = 0.2) +
+    labs(title = paste("Predicted Workloads Over Time with CIs at HNL on", weekend_bin_cat),
+         x = "Time (Hours)",
+         y = "Predicted Workload",
+         color = "Workload Type",
+         fill = "Workload Type") +
+    theme_minimal() +
+    scale_color_manual(values = c("actual_pred_hnl" = "#413691", "scheduled_pred_hnl" = "#D2058A", "actual_pred_hnl_ao" = "green")) +
+    scale_fill_manual(values = c("actual_pred_hnl" = "#413691", "scheduled_pred_hnl" = "#D2058A", "actual_pred_hnl_ao" = "green"))
+  
+  # Store the plot in the list
+  v_weekend_ao[[paste0("HNL_on_", weekend_bin_cat)]] <- plot
+  
+  # Define the file name based on the station and weekend_bin
+  file_name <- paste0("predicted_workloads_HNL_on_", weekend_bin_cat, ".jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+v_weekend_ao
+
+
+```
+
+### Difference - act vs sch
+```{r}
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_weekend_ao/difference"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Calculate the difference and CI for differences
+diff <- new_df_ao %>%
+  group_by(weekend_bin, time) %>%
+  mutate(
+    # Calculate the difference
+    difference = actual_pred_hnl - scheduled_pred_hnl,
+    # Round the difference
+    difference = round(difference, 0),
+    # CI bounds for differences
+    ci_low_diff = round((actual_pred_hnl_lower - scheduled_pred_hnl_upper), 0),
+    ci_high_diff = round((actual_pred_hnl_upper - scheduled_pred_hnl_lower), 0)
+  )
+
+# Initialize an empty list to store the plots
+d_weekend <- list()
+
+# Get unique combinations of weekend_bin and station
+weekend_combinations <- unique(new_df_ao %>% select(weekend_bin))
+
+# Loop through each combination of weekend_bin and station to create plots
+for (i in seq_along(weekend_combinations$weekend_bin)) {
+  
+  # Extract the specific combination of weekend_bin and station
+  weekend_bin_cat <- weekend_station_combinations$weekend_bin[i]
+  #station_cat <- weekend_station_combinations$station[i]
+  
+  # Filter data for the specific combination
+  day_data <- diff %>% filter(weekend_bin == weekend_bin_cat)
+  
+  # Create the plot with CI lines and a horizontal line at y = 0
+  plot <- ggplot(day_data, aes(x = time)) +
+    # Add CI lines for the differences
+    geom_ribbon(aes(ymin = ci_low_diff, ymax = ci_high_diff), fill = "#B0B0B0", alpha = 0.5) +
+    # Add the difference line
+    geom_line(aes(y = difference)) +
+    # Add a horizontal line at y = 0
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    # Add titles and labels
+    labs(title = paste("Differences between Actual and Scheduled Predictions on", weekend_bin_cat, "at HNL"),
+         x = "Time (Hours)",
+         y = "Difference (Actual - Scheduled)") +
+    theme_minimal()
+  
+  # Store the plot in the list
+  d_weekend[[paste0(weekend_bin_cat, "_at_HNL")]] <- plot
+  
+  # Define the file name based on the combination
+  file_name <- paste0("workload_differences_", weekend_bin_cat, "_at_HNL.jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+# View the list of plots
+d_weekend
+```
+
+### Difference - ao vs sch
+```{r}
+# Define the output folder (create the folder if it doesn't exist)
+output_folder <- "outputs_by_weekend_ao/difference"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Calculate the difference and CI for differences
+diff <- new_df_ao %>%
+  group_by(weekend_bin, time) %>%
+  mutate(
+    # Calculate the difference
+    difference = actual_pred_hnl_ao - scheduled_pred_hnl,
+    # Round the difference
+    difference = round(difference, 0),
+    # CI bounds for differences
+    ci_low_diff = round((actual_pred_hnl_ao_lower - scheduled_pred_hnl_upper), 0),
+    ci_high_diff = round((actual_pred_hnl_ao_upper - scheduled_pred_hnl_lower), 0)
+  )
+
+# Initialize an empty list to store the plots
+d_weekend <- list()
+
+# Get unique combinations of weekend_bin and station
+weekend_combinations <- unique(new_df_ao %>% select(weekend_bin))
+
+# Loop through each combination of weekend_bin and station to create plots
+for (i in seq_along(weekend_combinations$weekend_bin)) {
+  
+  # Extract the specific combination of weekend_bin and station
+  weekend_bin_cat <- weekend_station_combinations$weekend_bin[i]
+  #station_cat <- weekend_station_combinations$station[i]
+  
+  # Filter data for the specific combination
+  day_data <- diff %>% filter(weekend_bin == weekend_bin_cat)
+  
+  # Create the plot with CI lines and a horizontal line at y = 0
+  plot <- ggplot(day_data, aes(x = time)) +
+    # Add CI lines for the differences
+    geom_ribbon(aes(ymin = ci_low_diff, ymax = ci_high_diff), fill = "#B0B0B0", alpha = 0.5) +
+    # Add the difference line
+    geom_line(aes(y = difference)) +
+    # Add a horizontal line at y = 0
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    # Add titles and labels
+    labs(title = paste("Differences between Actual AO and Scheduled Predictions on", weekend_bin_cat, "at HNL"),
+         x = "Time (Hours)",
+         y = "Difference (Actual - Scheduled)") +
+    theme_minimal()
+  
+  # Store the plot in the list
+  d_weekend[[paste0(weekend_bin_cat, "_at_HNL")]] <- plot
+  
+  # Define the file name based on the combination
+  file_name <- paste0("workload_differences_AO_", weekend_bin_cat, "_at_HNL.jpeg")
+  
+  # Save the plot to the specified folder
+  ggsave(filename = file.path(output_folder, file_name), plot = plot, width = 8, height = 6)
+}
+
+# View the list of plots
+d_weekend
+
+```
